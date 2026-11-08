@@ -62,6 +62,43 @@ func TestAugmentedPath(t *testing.T) {
 	}
 }
 
+// Windows 的进程 PATH 在启动后不会再变，注册表里的用户 PATH 才是最新值；
+// 合并后还要避免同一个目录出现两次。
+func TestAugmentedPathMergesUserPath(t *testing.T) {
+	original := userPathFunc
+	t.Cleanup(func() { userPathFunc = original })
+
+	userDir := filepath.Join(t.TempDir(), "agy", "bin")
+	userPathFunc = func() string { return userDir }
+
+	res := augmentedPath("")
+	if !strings.Contains(strings.ToLower(res), strings.ToLower(userDir)) {
+		t.Fatalf("expected PATH to contain user dir %q, got: %s", userDir, res)
+	}
+
+	res2 := augmentedPath(res)
+	if got := strings.Count(strings.ToLower(res2), strings.ToLower(userDir)); got != 1 {
+		t.Fatalf("user dir appears %d times in augmented PATH: %s", got, res2)
+	}
+}
+
+// agy 的 Windows 安装脚本默认装到 %LOCALAPPDATA%\agy\bin，必须作为常见目录补进 PATH。
+func TestWindowsCommonPathDirsIncludesAgy(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("仅 Windows")
+	}
+	localAppData := filepath.Join(t.TempDir(), "Local")
+	t.Setenv("LOCALAPPDATA", localAppData)
+
+	want := filepath.Join(localAppData, "agy", "bin")
+	for _, dir := range windowsCommonPathDirs(t.TempDir()) {
+		if dir == want {
+			return
+		}
+	}
+	t.Fatalf("windowsCommonPathDirs 缺少 %q", want)
+}
+
 func TestFallbackEnvironment(t *testing.T) {
 	resetState(t)
 	defer resetState(t)

@@ -57,6 +57,9 @@ var (
 
 	// systemProxyFunc 提供包级可替换钩子，方便单元测试注入系统代理读取结果。
 	systemProxyFunc = systemProxyEnvironment
+
+	// userPathFunc 提供包级可替换钩子，方便单元测试注入注册表里的用户 PATH。
+	userPathFunc = windowsUserPath
 )
 
 // Environ 返回用户登录 Shell 环境的键值对列表（如 "KEY=VALUE"）。
@@ -184,12 +187,18 @@ func resolveExecutable(candidate string) (string, bool) {
 // 进程自己的 PATH（追加常见安装目录），保证 ProbePath 不等子进程也有东西可查。
 func currentPATH() string {
 	cacheMu.RLock()
-	if loaded {
-		path := cachedPath
-		cacheMu.RUnlock()
+	loadedNow := loaded
+	path := cachedPath
+	cacheMu.RUnlock()
+
+	if loadedNow {
+		if runtime.GOOS == "windows" {
+			// Windows 没有登录 Shell，PATH 可能在应用启动后被安装器改写（写入用户注册表）。
+			// 每次查找时按最新值重新合并，装完 CLI 不必重启应用。
+			return augmentedPath(path)
+		}
 		return path
 	}
-	cacheMu.RUnlock()
 	return augmentedPath(os.Getenv("PATH"))
 }
 
@@ -526,8 +535,9 @@ func addSystemProxy(envMap map[string]string) {
 
 // augmentedPath 的规则：
 // 1. 保留原有 entries 及其相对顺序；
-// 2. 预置平台相关的 common 目录；若原列表中未包含，则追加至末尾；
-// 3. 用平台的路径列表分隔符（os.PathListSeparator）重新拼接。
+// 2. Windows 追加注册表里最新的用户 PATH（进程环境在启动时就固定了）；
+// 3. 预置平台相关的 common 目录；若原列表中未包含，则追加至末尾；
+// 4. 用平台的路径列表分隔符（os.PathListSeparator）重新拼接。
 func augmentedPath(path string) string {
 	home, err := os.UserHomeDir()
 	if err != nil || home == "" {
@@ -535,29 +545,37 @@ func augmentedPath(path string) string {
 	}
 
 	var entries []string
-	if path != "" {
-		for _, part := range filepath.SplitList(path) {
-			if part != "" {
-				entries = append(entries, part)
-			}
+	seen := make(map[string]bool)
+	add := func(entry string) {
+		if entry == "" {
+			return
 		}
-	}
-
-	common := commonPathDirs(home)
-
-	exists := make(map[string]bool, len(entries))
-	for _, e := range entries {
-		exists[e] = true
-	}
-
-	for _, dir := range common {
-		if !exists[dir] {
-			entries = append(entries, dir)
-			exists[dir] = true
+		key := pathKey(entry)
+		if seen[key] {
+			return
 		}
+		seen[key] = true
+		entries = append(entries, entry)
+	}
+	for _, part := range filepath.SplitList(path) {
+		add(part)
+	}
+	for _, part := range filepath.SplitList(userPathFunc()) {
+		add(part)
+	}
+	for _, dir := range commonPathDirs(home) {
+		add(dir)
 	}
 
 	return strings.Join(entries, string(os.PathListSeparator))
+}
+
+// pathKey 把 PATH 条目归一化成去重用的键：Windows 路径大小写不敏感。
+func pathKey(entry string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToLower(entry)
+	}
+	return entry
 }
 
 // commonPathDirs 返回值得预置进 PATH 的常见安装目录，按平台区分。
@@ -595,6 +613,8 @@ func windowsCommonPathDirs(home string) []string {
 		dirs = append(dirs,
 			filepath.Join(localAppData, "Programs"),
 			filepath.Join(localAppData, "Microsoft", "WindowsApps"),
+			// agy 的官方安装脚本默认装到 %LOCALAPPDATA%\agy\bin。
+			filepath.Join(localAppData, "agy", "bin"),
 		)
 	}
 	if programFiles := os.Getenv("ProgramFiles"); programFiles != "" {
